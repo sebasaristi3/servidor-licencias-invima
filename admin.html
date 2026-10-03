@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panel de administración - Autofill formularios</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 960px; margin: 32px auto; padding: 0 16px; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  h2 { font-size: 1rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e0e0e0; font-size: 0.88rem; }
+  th { background: #f5f5f5; }
+  .activo { color: #1a7f37; font-weight: 600; }
+  .inactivo { color: #b42318; font-weight: 600; }
+  code { background: #f0f0f0; padding: 2px 5px; border-radius: 4px; font-size: 0.82rem; }
+  button { cursor: pointer; border: 1px solid #ccc; background: #fff; border-radius: 6px; padding: 5px 10px; font-size: 0.82rem; }
+  button:hover { background: #f0f0f0; }
+  form.nuevo { margin-top: 24px; padding: 16px; border: 1px solid #e0e0e0; border-radius: 8px; max-width: 420px; }
+  form.nuevo input { display: block; width: 100%; margin: 6px 0 12px; padding: 7px 9px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-size: 0.9rem; }
+  form.nuevo label { font-size: 0.82rem; color: #555; }
+  .submit { background: #1a1a1a; color: #fff; border: none; padding: 9px 18px; border-radius: 6px; font-size: 0.9rem; }
+  #login { max-width: 320px; margin: 80px auto; text-align: center; }
+  #login input { width: 100%; padding: 9px; margin: 12px 0; border-radius: 6px; border: 1px solid #ccc; box-sizing: border-box; }
+  .error { color: #b42318; font-size: 0.85rem; min-height: 1.2em; }
+  .vacio { color: #888; font-size: 0.88rem; padding: 16px 0; }
+</style>
+</head>
+<body>
+
+<div id="login">
+  <h1>Panel de administración</h1>
+  <p style="color:#666; font-size:0.9rem">Autofill formularios</p>
+  <input id="password" type="password" placeholder="Contraseña de administrador" onkeydown="if(event.key==='Enter') ingresar()">
+  <button class="submit" onclick="ingresar()">Entrar</button>
+  <p class="error" id="login-error"></p>
+</div>
+
+<div id="panel" style="display:none">
+  <h1>Clientes</h1>
+  <p style="color:#666; font-size:0.9rem">Autofill formularios — licencias y uso</p>
+  <table id="tabla-clientes">
+    <thead>
+      <tr>
+        <th>Empresa</th><th>NIT</th><th>API Key</th><th>Estado</th>
+        <th>Corridas</th><th>Ingredientes procesados</th><th>Exitosos</th><th>Creado</th><th></th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <form class="nuevo" onsubmit="guardarCliente(event)">
+    <h2>Agregar / actualizar cliente</h2>
+    <label>Empresa</label>
+    <input id="f-empresa" required>
+    <label>NIT (opcional)</label>
+    <input id="f-nit">
+    <label>API Key (se le entrega al cliente dentro de su .exe)</label>
+    <input id="f-apikey" required placeholder="ej. SOLX-0007-NOMBRE-CLIENTE">
+    <button class="submit" type="submit">Guardar</button>
+  </form>
+</div>
+
+<script>
+let PASSWORD = sessionStorage.getItem("admin_password") || "";
+
+async function ingresar() {
+  PASSWORD = document.getElementById("password").value;
+  const ok = await cargarClientes();
+  if (ok) {
+    sessionStorage.setItem("admin_password", PASSWORD);
+    document.getElementById("login").style.display = "none";
+    document.getElementById("panel").style.display = "block";
+  } else {
+    document.getElementById("login-error").textContent = "Contraseña incorrecta.";
+  }
+}
+
+async function cargarClientes() {
+  const resp = await fetch("/admin/clientes", { headers: { "X-Admin-Password": PASSWORD } });
+  if (!resp.ok) return false;
+  const clientes = await resp.json();
+  const tbody = document.querySelector("#tabla-clientes tbody");
+  tbody.innerHTML = "";
+  if (clientes.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" class="vacio">Todavía no hay clientes registrados.</td></tr>';
+    return true;
+  }
+  for (const c of clientes) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${c.empresa}</td>
+      <td>${c.nit || ""}</td>
+      <td><code>${c.api_key}</code></td>
+      <td class="${c.activo ? 'activo' : 'inactivo'}">${c.activo ? "Activo" : "Inactivo"}</td>
+      <td>${c.corridas}</td>
+      <td>${c.total_filas}</td>
+      <td>${c.total_exitosas}</td>
+      <td>${new Date(c.creado_en).toLocaleDateString()}</td>
+      <td><button onclick="cambiarEstado('${c.api_key}', ${!c.activo})">${c.activo ? "Desactivar" : "Activar"}</button></td>
+    `;
+    tbody.appendChild(tr);
+  }
+  return true;
+}
+
+async function cambiarEstado(apiKey, nuevoEstado) {
+  await fetch(`/admin/clientes/${encodeURIComponent(apiKey)}?activo=${nuevoEstado}`, {
+    method: "PATCH",
+    headers: { "X-Admin-Password": PASSWORD },
+  });
+  cargarClientes();
+}
+
+async function guardarCliente(ev) {
+  ev.preventDefault();
+  const body = {
+    empresa: document.getElementById("f-empresa").value,
+    nit: document.getElementById("f-nit").value || null,
+    api_key: document.getElementById("f-apikey").value,
+    activo: true,
+  };
+  await fetch("/admin/clientes", {
+    method: "POST",
+    headers: { "X-Admin-Password": PASSWORD, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  document.querySelector("form.nuevo").reset();
+  cargarClientes();
+}
+
+if (PASSWORD) {
+  cargarClientes().then(ok => {
+    if (ok) {
+      document.getElementById("login").style.display = "none";
+      document.getElementById("panel").style.display = "block";
+    }
+  });
+}
+</script>
+
+</body>
+</html>
