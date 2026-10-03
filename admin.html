@@ -44,7 +44,7 @@
     <thead>
       <tr>
         <th>Empresa</th><th>NIT</th><th>API Key</th><th>Estado</th>
-        <th>Corridas</th><th>Ingredientes procesados</th><th>Exitosos</th><th>Creado</th><th></th>
+        <th>Corridas</th><th>Ingredientes procesados</th><th>Exitosos</th><th>% Éxito</th><th>Creado</th><th></th>
       </tr>
     </thead>
     <tbody></tbody>
@@ -60,10 +60,26 @@
     <input id="f-apikey" required placeholder="ej. SOLX-0007-NOMBRE-CLIENTE">
     <button class="submit" type="submit">Guardar</button>
   </form>
+
+  <h1 style="margin-top:36px">Uso por día</h1>
+  <p style="color:#666; font-size:0.9rem">Todos los clientes juntos, últimos días con actividad</p>
+  <table id="tabla-uso-diario">
+    <thead>
+      <tr>
+        <th>Fecha</th><th>Corridas</th><th>Clientes activos</th><th>Ingredientes procesados</th><th>Exitosos</th><th>% Éxito</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 </div>
 
 <script>
 let PASSWORD = sessionStorage.getItem("admin_password") || "";
+
+function pctExito(exitosas, totalFilas) {
+  if (!totalFilas) return "—";
+  return Math.round((exitosas / totalFilas) * 100) + "%";
+}
 
 async function ingresar() {
   PASSWORD = document.getElementById("password").value;
@@ -72,6 +88,7 @@ async function ingresar() {
     sessionStorage.setItem("admin_password", PASSWORD);
     document.getElementById("login").style.display = "none";
     document.getElementById("panel").style.display = "block";
+    cargarUsoDiario();
   } else {
     document.getElementById("login-error").textContent = "Contraseña incorrecta.";
   }
@@ -84,7 +101,7 @@ async function cargarClientes() {
   const tbody = document.querySelector("#tabla-clientes tbody");
   tbody.innerHTML = "";
   if (clientes.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" class="vacio">Todavía no hay clientes registrados.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="vacio">Todavía no hay clientes registrados.</td></tr>';
     return true;
   }
   for (const c of clientes) {
@@ -97,8 +114,34 @@ async function cargarClientes() {
       <td>${c.corridas}</td>
       <td>${c.total_filas}</td>
       <td>${c.total_exitosas}</td>
+      <td>${pctExito(c.total_exitosas, c.total_filas)}</td>
       <td>${new Date(c.creado_en).toLocaleDateString()}</td>
       <td><button onclick="cambiarEstado('${c.api_key}', ${!c.activo})">${c.activo ? "Desactivar" : "Activar"}</button></td>
+    `;
+    tbody.appendChild(tr);
+  }
+  return true;
+}
+
+async function cargarUsoDiario() {
+  const resp = await fetch("/admin/uso-diario", { headers: { "X-Admin-Password": PASSWORD } });
+  if (!resp.ok) return false;
+  const dias = await resp.json();
+  const tbody = document.querySelector("#tabla-uso-diario tbody");
+  tbody.innerHTML = "";
+  if (dias.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="vacio">Todavía no hay uso registrado.</td></tr>';
+    return true;
+  }
+  for (const d of dias) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${new Date(d.dia).toLocaleDateString()}</td>
+      <td>${d.corridas}</td>
+      <td>${d.clientes_activos}</td>
+      <td>${d.total_filas}</td>
+      <td>${d.total_exitosas}</td>
+      <td>${pctExito(d.total_exitosas, d.total_filas)}</td>
     `;
     tbody.appendChild(tr);
   }
@@ -135,6 +178,7 @@ if (PASSWORD) {
     if (ok) {
       document.getElementById("login").style.display = "none";
       document.getElementById("panel").style.display = "block";
+      cargarUsoDiario();
     }
   });
 }

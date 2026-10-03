@@ -166,6 +166,28 @@ def listar_clientes():
     return filas
 
 
+@app.get("/admin/uso-diario", dependencies=[Depends(verificar_admin)])
+def uso_diario():
+    """Consolidado de uso por día (todos los clientes juntos), últimos 60 días con actividad."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT date_trunc('day', fecha) AS dia,
+                       COUNT(*) AS corridas,
+                       COUNT(DISTINCT api_key) AS clientes_activos,
+                       COALESCE(SUM(total_filas), 0) AS total_filas,
+                       COALESCE(SUM(exitosas), 0) AS total_exitosas
+                FROM usos
+                GROUP BY dia
+                ORDER BY dia DESC
+                LIMIT 60
+                """
+            )
+            filas = cur.fetchall()
+    return filas
+
+
 @app.post("/admin/clientes", dependencies=[Depends(verificar_admin)])
 def crear_o_actualizar_cliente(cliente: ClienteIn):
     with get_conn() as conn:
