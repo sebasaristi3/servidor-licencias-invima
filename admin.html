@@ -62,11 +62,48 @@
   </form>
 
   <h1 style="margin-top:36px">Uso por día</h1>
-  <p style="color:#666; font-size:0.9rem">Todos los clientes juntos, últimos días con actividad</p>
+  <p style="color:#666; font-size:0.9rem">Una fila por cliente y día, últimos 60 días</p>
   <table id="tabla-uso-diario">
     <thead>
       <tr>
-        <th>Fecha</th><th>Corridas</th><th>Clientes activos</th><th>Ingredientes procesados</th><th>Exitosos</th><th>% Éxito</th>
+        <th>Fecha</th><th>Empresa</th><th>Corridas</th><th>Ingredientes procesados</th><th>Exitosos</th><th>% Éxito</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <h1 style="margin-top:36px">Actividad por cliente</h1>
+  <p style="color:#666; font-size:0.9rem">Última corrida, inactividad, tamaño de lote y frecuencia de uso real</p>
+  <table id="tabla-actividad">
+    <thead>
+      <tr>
+        <th>Empresa</th><th>Última corrida</th><th>Inactivo hace</th>
+        <th>Corridas</th><th>Promedio ingredientes/corrida</th><th>Frecuencia (días entre corridas)</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <h1 style="margin-top:36px">Uso por horario</h1>
+  <p style="color:#666; font-size:0.9rem">Todas las corridas juntas, hora local Colombia — para saber cuándo priorizar soporte</p>
+  <div style="display:flex; gap:32px; flex-wrap:wrap">
+    <table id="tabla-uso-hora" style="flex:1; min-width:280px">
+      <thead><tr><th>Hora del día</th><th>Corridas</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <table id="tabla-uso-dia-semana" style="flex:1; min-width:280px">
+      <thead><tr><th>Día de la semana</th><th>Corridas</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <h1 style="margin-top:36px">Corridas recientes</h1>
+  <p style="color:#666; font-size:0.9rem">Últimas 50, con duración y qué ingrediente detuvo el proceso (si aplica)</p>
+  <table id="tabla-corridas">
+    <thead>
+      <tr>
+        <th>Fecha y hora</th><th>Empresa</th><th>Ingredientes</th><th>Exitosos</th>
+        <th>Duración</th><th>Ingrediente que falló</th><th>Versión</th>
       </tr>
     </thead>
     <tbody></tbody>
@@ -81,6 +118,15 @@ function pctExito(exitosas, totalFilas) {
   return Math.round((exitosas / totalFilas) * 100) + "%";
 }
 
+const NOMBRES_DIA_SEMANA = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+
+function cargarTodo() {
+  cargarUsoDiario();
+  cargarActividad();
+  cargarUsoPorHorario();
+  cargarCorridasRecientes();
+}
+
 async function ingresar() {
   PASSWORD = document.getElementById("password").value;
   const ok = await cargarClientes();
@@ -88,7 +134,7 @@ async function ingresar() {
     sessionStorage.setItem("admin_password", PASSWORD);
     document.getElementById("login").style.display = "none";
     document.getElementById("panel").style.display = "block";
-    cargarUsoDiario();
+    cargarTodo();
   } else {
     document.getElementById("login-error").textContent = "Contraseña incorrecta.";
   }
@@ -137,11 +183,93 @@ async function cargarUsoDiario() {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${new Date(d.dia).toLocaleDateString()}</td>
+      <td>${d.empresa}</td>
       <td>${d.corridas}</td>
-      <td>${d.clientes_activos}</td>
       <td>${d.total_filas}</td>
       <td>${d.total_exitosas}</td>
       <td>${pctExito(d.total_exitosas, d.total_filas)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+  return true;
+}
+
+async function cargarActividad() {
+  const resp = await fetch("/admin/actividad-clientes", { headers: { "X-Admin-Password": PASSWORD } });
+  if (!resp.ok) return false;
+  const filas = await resp.json();
+  const tbody = document.querySelector("#tabla-actividad tbody");
+  tbody.innerHTML = "";
+  if (filas.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="vacio">Todavía no hay clientes registrados.</td></tr>';
+    return true;
+  }
+  for (const f of filas) {
+    const tr = document.createElement("tr");
+    const sinUso = f.ultima_corrida === null;
+    const inactivoLargo = !sinUso && f.dias_inactivo >= 15;
+    tr.innerHTML = `
+      <td>${f.empresa}</td>
+      <td>${sinUso ? "—" : new Date(f.ultima_corrida).toLocaleDateString()}</td>
+      <td class="${inactivoLargo ? 'inactivo' : ''}">${sinUso ? "Nunca ha usado" : f.dias_inactivo + " días"}</td>
+      <td>${f.corridas}</td>
+      <td>${f.promedio_filas_por_corrida ?? "—"}</td>
+      <td>${f.frecuencia_dias ?? "—"}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+  return true;
+}
+
+async function cargarUsoPorHorario() {
+  const resp = await fetch("/admin/uso-por-horario", { headers: { "X-Admin-Password": PASSWORD } });
+  if (!resp.ok) return false;
+  const datos = await resp.json();
+
+  const tbodyHora = document.querySelector("#tabla-uso-hora tbody");
+  tbodyHora.innerHTML = "";
+  if (datos.por_hora.length === 0) {
+    tbodyHora.innerHTML = '<tr><td colspan="2" class="vacio">Sin datos todavía.</td></tr>';
+  }
+  for (const h of datos.por_hora) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${String(h.hora).padStart(2, "0")}:00 - ${String(h.hora).padStart(2, "0")}:59</td><td>${h.corridas}</td>`;
+    tbodyHora.appendChild(tr);
+  }
+
+  const tbodyDia = document.querySelector("#tabla-uso-dia-semana tbody");
+  tbodyDia.innerHTML = "";
+  if (datos.por_dia_semana.length === 0) {
+    tbodyDia.innerHTML = '<tr><td colspan="2" class="vacio">Sin datos todavía.</td></tr>';
+  }
+  for (const d of datos.por_dia_semana) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${NOMBRES_DIA_SEMANA[d.dia_semana]}</td><td>${d.corridas}</td>`;
+    tbodyDia.appendChild(tr);
+  }
+  return true;
+}
+
+async function cargarCorridasRecientes() {
+  const resp = await fetch("/admin/corridas-recientes", { headers: { "X-Admin-Password": PASSWORD } });
+  if (!resp.ok) return false;
+  const filas = await resp.json();
+  const tbody = document.querySelector("#tabla-corridas tbody");
+  tbody.innerHTML = "";
+  if (filas.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="vacio">Todavía no hay corridas registradas.</td></tr>';
+    return true;
+  }
+  for (const f of filas) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${new Date(f.fecha).toLocaleString()}</td>
+      <td>${f.empresa}</td>
+      <td>${f.total_filas}</td>
+      <td>${f.exitosas}</td>
+      <td>${f.duracion_segundos != null ? f.duracion_segundos + " s" : "—"}</td>
+      <td>${f.ingrediente_fallido || "—"}</td>
+      <td>${f.version_exe || "—"}</td>
     `;
     tbody.appendChild(tr);
   }
@@ -178,7 +306,7 @@ if (PASSWORD) {
     if (ok) {
       document.getElementById("login").style.display = "none";
       document.getElementById("panel").style.display = "block";
-      cargarUsoDiario();
+      cargarTodo();
     }
   });
 }

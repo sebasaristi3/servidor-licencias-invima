@@ -83,6 +83,13 @@ def init_db():
                 )
                 """
             )
+            # ALTER ... ADD COLUMN IF NOT EXISTS es idempotente: sirve tanto para
+            # una base de datos nueva (ya la crea CREATE TABLE de arriba, esto no
+            # hace nada) como para una ya existente en producción (le agrega las
+            # columnas nuevas sin perder los datos que ya tiene).
+            cur.execute("ALTER TABLE usos ADD COLUMN IF NOT EXISTS duracion_segundos REAL")
+            cur.execute("ALTER TABLE usos ADD COLUMN IF NOT EXISTS ingrediente_fallido TEXT")
+            cur.execute("ALTER TABLE usos ADD COLUMN IF NOT EXISTS version_exe TEXT")
         conn.commit()
 
 
@@ -119,6 +126,13 @@ def obtener_receta_ingredientes(x_api_key: str = Header(..., alias="X-API-Key"))
 class RegistroUso(BaseModel):
     total_filas: int
     exitosas: int
+    # Los tres siguientes son opcionales a propósito: así un .exe viejo que
+    # todavía no los envía sigue funcionando sin romper nada (quedan como
+    # NULL en esa fila), y no hace falta forzar a todos los clientes a
+    # actualizar el mismo día que se agrega un dato nuevo.
+    duracion_segundos: Optional[float] = None
+    ingrediente_fallido: Optional[str] = None
+    version_exe: Optional[str] = None
 
 
 @app.post("/uso/registrar")
@@ -127,8 +141,11 @@ def registrar_uso(datos: RegistroUso, x_api_key: str = Header(..., alias="X-API-
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO usos (api_key, total_filas, exitosas) VALUES (%s, %s, %s)",
-                (x_api_key, datos.total_filas, datos.exitosas),
+                """
+                INSERT INTO usos (api_key, total_filas, exitosas, duracion_segundos, ingrediente_fallido, version_exe)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (x_api_key, datos.total_filas, datos.exitosas, datos.duracion_segundos, datos.ingrediente_fallido, datos.version_exe),
             )
         conn.commit()
     return {"status": "ok"}
@@ -168,24 +185,109 @@ def listar_clientes():
 
 @app.get("/admin/uso-diario", dependencies=[Depends(verificar_admin)])
 def uso_diario():
-    """Consolidado de uso por día (todos los clientes juntos), últimos 60 días con actividad."""
+    """Uso por día, desglosado por cliente (una fila por cliente y día), últimos 60 días."""
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT date_trunc('day', fecha) AS dia,
+                SELECT date_trunc('day', u.fecha) AS dia,
+                       c.empresa,
+                       u.api_key,
                        COUNT(*) AS corridas,
-                       COUNT(DISTINCT api_key) AS clientes_activos,
-                       COALESCE(SUM(total_filas), 0) AS total_filas,
-                       COALESCE(SUM(exitosas), 0) AS total_exitosas
-                FROM usos
-                GROUP BY dia
-                ORDER BY dia DESC
-                LIMIT 60
+                       COALESCE(SUM(u.total_filas), 0) AS total_filas,
+                       COALESCE(SUM(u.exitosas), 0) AS total_exitosas
+                FROM usos u
+                JOIN clientes c ON c.api_key = u.api_key
+                WHERE u.fecha >= now() - interval '60 days'
+                GROUP BY dia, c.empresa, u.api_key
+                ORDER BY dia DESC, c.empresa
                 """
             )
             filas = cur.fetchall()
     return filas
+
+
+@app.get("/admin/actividad-clientes", dependencies=[Depends(verificar_admin)])
+def actividad_clientes():
+    """
+    Por cliente: cuándo fue su última corrida (y hace cuántos días, para
+    detectar clientes inactivos/en riesgo de cancelar), cuántos ingredientes
+    sube en promedio por corrida, y cada cuántos días corre el programa en
+    promedio (frecuencia real de uso).
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT c.empresa,
+                       c.api_key,
+                       MAX(u.fecha) AS ultima_corrida,
+                       EXTRACT(DAY FROM now() - MAX(u.fecha))::int AS dias_inactivo,
+                       COUNT(u.id) AS corridas,
+                       ROUND(AVG(u.total_filas)::numeric, 1)::float AS promedio_filas_por_corrida,
+                       CASE WHEN COUNT(u.id) > 1
+                            THEN ROUND((EXTRACT(EPOCH FROM (MAX(u.fecha) - MIN(u.fecha))) / 86400.0 / (COUNT(u.id) - 1))::numeric, 1)::float
+                            ELSE NULL
+                       END AS frecuencia_dias
+                FROM clientes c
+                LEFT JOIN usos u ON u.api_key = c.api_key
+                GROUP BY c.empresa, c.api_key
+                ORDER BY ultima_corrida DESC NULLS LAST
+                """
+            )
+            filas = cur.fetchall()
+    return filas
+
+
+@app.get("/admin/corridas-recientes", dependencies=[Depends(verificar_admin)])
+def corridas_recientes():
+    """Log crudo (sin agregar) de las últimas 50 corridas, con detalle de duración y qué falló."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT u.fecha, c.empresa, u.total_filas, u.exitosas,
+                       u.duracion_segundos, u.ingrediente_fallido, u.version_exe
+                FROM usos u
+                JOIN clientes c ON c.api_key = u.api_key
+                ORDER BY u.fecha DESC
+                LIMIT 50
+                """
+            )
+            filas = cur.fetchall()
+    return filas
+
+
+@app.get("/admin/uso-por-horario", dependencies=[Depends(verificar_admin)])
+def uso_por_horario():
+    """
+    Todas las corridas juntas, agrupadas por hora del día y por día de la
+    semana (hora local de Colombia) -- util para saber cuándo priorizar
+    soporte o anunciar mantenimientos del servidor.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT EXTRACT(HOUR FROM fecha AT TIME ZONE 'America/Bogota')::int AS hora,
+                       COUNT(*) AS corridas
+                FROM usos
+                GROUP BY hora
+                ORDER BY hora
+                """
+            )
+            por_hora = cur.fetchall()
+            cur.execute(
+                """
+                SELECT EXTRACT(DOW FROM fecha AT TIME ZONE 'America/Bogota')::int AS dia_semana,
+                       COUNT(*) AS corridas
+                FROM usos
+                GROUP BY dia_semana
+                ORDER BY dia_semana
+                """
+            )
+            por_dia_semana = cur.fetchall()
+    return {"por_hora": por_hora, "por_dia_semana": por_dia_semana}
 
 
 @app.post("/admin/clientes", dependencies=[Depends(verificar_admin)])
