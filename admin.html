@@ -43,8 +43,8 @@
   <table id="tabla-clientes">
     <thead>
       <tr>
-        <th>Empresa</th><th>NIT</th><th>API Key</th><th>Estado</th>
-        <th>Corridas</th><th>Ingredientes procesados</th><th>Exitosos</th><th>% Éxito</th><th>Creado</th><th></th>
+        <th>Empresa</th><th>NIT</th><th>API Key</th><th>Estado</th><th>Equipos</th>
+        <th>Corridas</th><th>Ingredientes procesados</th><th>Exitosos</th><th>% Éxito</th><th>Creado</th><th></th><th></th>
       </tr>
     </thead>
     <tbody></tbody>
@@ -56,10 +56,21 @@
     <input id="f-empresa" required>
     <label>NIT (opcional)</label>
     <input id="f-nit">
-    <label>API Key (se le entrega al cliente dentro de su .exe)</label>
+    <label>API Key (se le entrega al cliente, la pega en el programa la primera vez)</label>
     <input id="f-apikey" required placeholder="ej. SOLX-0007-NOMBRE-CLIENTE">
+    <label>Límite de equipos (opcional, por defecto 2)</label>
+    <input id="f-limite" type="number" min="1" placeholder="2">
     <button class="submit" type="submit">Guardar</button>
   </form>
+
+  <h1 style="margin-top:36px">Equipos activados</h1>
+  <p style="color:#666; font-size:0.9rem">Cada computador que ha usado una licencia — libera uno si el cliente cambió de equipo</p>
+  <table id="tabla-dispositivos">
+    <thead>
+      <tr><th>Empresa</th><th>Equipo (ID)</th><th>IP</th><th>Primera vez</th><th>Última vez</th><th></th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 
   <h1 style="margin-top:36px">Uso por día</h1>
   <p style="color:#666; font-size:0.9rem">Una fila por cliente y día, últimos 60 días</p>
@@ -121,6 +132,7 @@ function pctExito(exitosas, totalFilas) {
 const NOMBRES_DIA_SEMANA = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
 
 function cargarTodo() {
+  cargarDispositivos();
   cargarUsoDiario();
   cargarActividad();
   cargarUsoPorHorario();
@@ -147,7 +159,7 @@ async function cargarClientes() {
   const tbody = document.querySelector("#tabla-clientes tbody");
   tbody.innerHTML = "";
   if (clientes.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="10" class="vacio">Todavía no hay clientes registrados.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="12" class="vacio">Todavía no hay clientes registrados.</td></tr>';
     return true;
   }
   for (const c of clientes) {
@@ -157,16 +169,68 @@ async function cargarClientes() {
       <td>${c.nit || ""}</td>
       <td><code>${c.api_key}</code></td>
       <td class="${c.activo ? 'activo' : 'inactivo'}">${c.activo ? "Activo" : "Inactivo"}</td>
+      <td>${c.dispositivos_registrados}/${c.limite_dispositivos}</td>
       <td>${c.corridas}</td>
       <td>${c.total_filas}</td>
       <td>${c.total_exitosas}</td>
       <td>${pctExito(c.total_exitosas, c.total_filas)}</td>
       <td>${new Date(c.creado_en).toLocaleDateString()}</td>
       <td><button onclick="cambiarEstado('${c.api_key}', ${!c.activo})">${c.activo ? "Desactivar" : "Activar"}</button></td>
+      <td><button onclick="cambiarLimite('${c.api_key}', ${c.limite_dispositivos})">Cambiar límite</button></td>
     `;
     tbody.appendChild(tr);
   }
   return true;
+}
+
+async function cargarDispositivos() {
+  const resp = await fetch("/admin/dispositivos", { headers: { "X-Admin-Password": PASSWORD } });
+  if (!resp.ok) return false;
+  const filas = await resp.json();
+  const tbody = document.querySelector("#tabla-dispositivos tbody");
+  tbody.innerHTML = "";
+  if (filas.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="vacio">Todavía no hay equipos registrados.</td></tr>';
+    return true;
+  }
+  for (const d of filas) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${d.empresa}</td>
+      <td><code>${d.device_id.slice(0, 8)}…</code></td>
+      <td>${d.ip || "—"}</td>
+      <td>${new Date(d.primera_vez).toLocaleDateString()}</td>
+      <td>${new Date(d.ultima_vez).toLocaleString()}</td>
+      <td><button onclick="liberarDispositivo('${d.api_key}', '${d.device_id}')">Liberar</button></td>
+    `;
+    tbody.appendChild(tr);
+  }
+  return true;
+}
+
+async function liberarDispositivo(apiKey, deviceId) {
+  if (!confirm("¿Liberar este equipo? El cliente podrá activar la licencia en uno nuevo (o en este mismo, si vuelve a correr el programa).")) return;
+  await fetch(`/admin/dispositivos/${encodeURIComponent(apiKey)}/${encodeURIComponent(deviceId)}`, {
+    method: "DELETE",
+    headers: { "X-Admin-Password": PASSWORD },
+  });
+  cargarDispositivos();
+  cargarClientes();
+}
+
+async function cambiarLimite(apiKey, limiteActual) {
+  const nuevo = prompt("Nuevo límite de equipos para esta licencia:", limiteActual);
+  if (nuevo === null) return;
+  const n = parseInt(nuevo, 10);
+  if (!Number.isFinite(n) || n < 1) {
+    alert("Ingresa un número válido (1 o más).");
+    return;
+  }
+  await fetch(`/admin/clientes/${encodeURIComponent(apiKey)}/limite-dispositivos?limite=${n}`, {
+    method: "PATCH",
+    headers: { "X-Admin-Password": PASSWORD },
+  });
+  cargarClientes();
 }
 
 async function cargarUsoDiario() {
@@ -286,11 +350,13 @@ async function cambiarEstado(apiKey, nuevoEstado) {
 
 async function guardarCliente(ev) {
   ev.preventDefault();
+  const limiteInput = document.getElementById("f-limite").value;
   const body = {
     empresa: document.getElementById("f-empresa").value,
     nit: document.getElementById("f-nit").value || null,
     api_key: document.getElementById("f-apikey").value,
     activo: true,
+    limite_dispositivos: limiteInput ? parseInt(limiteInput, 10) : 2,
   };
   await fetch("/admin/clientes", {
     method: "POST",

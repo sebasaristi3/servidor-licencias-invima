@@ -1,18 +1,29 @@
 """
 Servidor de licencias, receta y uso - Autofill formularios
 ================================================================
-Tres responsabilidades:
+Cuatro responsabilidades:
   1. Validar si un cliente tiene licencia activa (por su API key), contra
      una base de datos Postgres real (ya no un diccionario en memoria).
   2. Si la tiene, entregarle la "receta" (los datos que el programa local
      necesita para funcionar, ej. los IDs de los campos del formulario).
   3. Registrar cuantos ingredientes se procesaron en cada corrida, para
      estadisticas de uso por cliente.
+  4. Controlar en cuantos equipos distintos se esta usando cada licencia
+     (ver "dispositivos" mas abajo): cada API key tiene un limite de
+     equipos (por defecto 2), para que un cliente no pueda repartir su
+     misma clave a otra empresa o a mas puestos de los que compro.
 
 La API key va en el header X-API-Key en cada llamada del cliente. Sin una
 API key valida y activa, no se entrega nada -- asi el programa local nunca
 es util por si solo, aunque alguien copie el .exe/.py y se lo pase a otra
 persona.
+
+Ademas, cada llamada manda un header X-Device-Id: un identificador unico
+que el programa genera una sola vez por computador (no esta atado al
+hardware, es un valor aleatorio guardado en un archivo local junto al
+programa). El servidor lleva la cuenta de cuantos device_id distintos ha
+visto para cada API key; al llegar al limite de ese cliente, un equipo
+nuevo queda bloqueado hasta que se libere uno desde el panel.
 
 Panel de administracion simple en /admin (protegido con una contrasena,
 variable de entorno ADMIN_PASSWORD): agregar/activar/desactivar clientes y
@@ -29,7 +40,7 @@ from typing import Optional
 
 import psycopg2
 import psycopg2.extras
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -90,6 +101,20 @@ def init_db():
             cur.execute("ALTER TABLE usos ADD COLUMN IF NOT EXISTS duracion_segundos REAL")
             cur.execute("ALTER TABLE usos ADD COLUMN IF NOT EXISTS ingrediente_fallido TEXT")
             cur.execute("ALTER TABLE usos ADD COLUMN IF NOT EXISTS version_exe TEXT")
+            cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS limite_dispositivos INTEGER NOT NULL DEFAULT 2")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dispositivos (
+                    id SERIAL PRIMARY KEY,
+                    api_key TEXT NOT NULL REFERENCES clientes(api_key),
+                    device_id TEXT NOT NULL,
+                    ip TEXT,
+                    primera_vez TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    ultima_vez TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (api_key, device_id)
+                )
+                """
+            )
         conn.commit()
 
 
@@ -106,6 +131,68 @@ def validar_cliente(api_key: str) -> dict:
     return cliente
 
 
+def ip_cliente(request: Request) -> str:
+    """
+    IP real del computador que llamo, considerando que el servidor corre
+    detras de un proxy (Railway): si viene el header X-Forwarded-For, esa es
+    la IP real del cliente -- request.client.host en ese caso seria la IP
+    interna del proxy, no la del cliente.
+    """
+    adelante = request.headers.get("x-forwarded-for")
+    if adelante:
+        return adelante.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+def registrar_dispositivo(api_key: str, device_id: str, ip: str, limite: int) -> None:
+    """
+    Registra (o actualiza) el equipo desde el que se esta usando esta API
+    key, para poder limitar en cuantos equipos distintos sirve una misma
+    licencia (ver limite_dispositivos en la tabla clientes).
+
+    Si el device_id ya estaba registrado para este cliente, solo actualiza
+    cuando se vio por ultima vez y desde que IP -- es el mismo equipo
+    volviendo a usar el programa, no cuenta como uno nuevo. Si es un
+    device_id nuevo, primero revisa que el cliente no haya llegado ya a su
+    limite de equipos antes de agregarlo.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id FROM dispositivos WHERE api_key = %s AND device_id = %s",
+                (api_key, device_id),
+            )
+            existente = cur.fetchone()
+        if existente:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispositivos SET ultima_vez = now(), ip = %s WHERE id = %s",
+                    (ip, existente["id"]),
+                )
+            conn.commit()
+            return
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM dispositivos WHERE api_key = %s", (api_key,))
+            total = cur.fetchone()["n"]
+
+    if total >= limite:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Esta licencia ya esta activada en el numero maximo de equipos "
+                f"permitidos ({limite}). Contacta a Solucionex IA para liberar un equipo."
+            ),
+        )
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO dispositivos (api_key, device_id, ip) VALUES (%s, %s, %s)",
+                (api_key, device_id, ip),
+            )
+        conn.commit()
+
+
 def verificar_admin(x_admin_password: str = Header(..., alias="X-Admin-Password")):
     if x_admin_password != ADMIN_PASSWORD:
         raise HTTPException(status_code=403, detail="Contraseña de administrador incorrecta")
@@ -118,8 +205,13 @@ def estado():
 
 
 @app.post("/receta/agregar-ingrediente")
-def obtener_receta_ingredientes(x_api_key: str = Header(..., alias="X-API-Key")):
+def obtener_receta_ingredientes(
+    request: Request,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+    x_device_id: str = Header(..., alias="X-Device-Id"),
+):
     cliente = validar_cliente(x_api_key)
+    registrar_dispositivo(x_api_key, x_device_id, ip_cliente(request), cliente["limite_dispositivos"])
     return {"empresa": cliente["empresa"], "campos": RECETA_AGREGAR_INGREDIENTE}
 
 
@@ -136,8 +228,14 @@ class RegistroUso(BaseModel):
 
 
 @app.post("/uso/registrar")
-def registrar_uso(datos: RegistroUso, x_api_key: str = Header(..., alias="X-API-Key")):
-    validar_cliente(x_api_key)
+def registrar_uso(
+    datos: RegistroUso,
+    request: Request,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+    x_device_id: str = Header(..., alias="X-Device-Id"),
+):
+    cliente = validar_cliente(x_api_key)
+    registrar_dispositivo(x_api_key, x_device_id, ip_cliente(request), cliente["limite_dispositivos"])
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -161,6 +259,7 @@ class ClienteIn(BaseModel):
     empresa: str
     nit: Optional[str] = None
     activo: bool = True
+    limite_dispositivos: int = 2
 
 
 @app.get("/admin/clientes", dependencies=[Depends(verificar_admin)])
@@ -169,10 +268,11 @@ def listar_clientes():
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT c.api_key, c.empresa, c.nit, c.activo, c.creado_en,
+                SELECT c.api_key, c.empresa, c.nit, c.activo, c.creado_en, c.limite_dispositivos,
                        COUNT(u.id) AS corridas,
                        COALESCE(SUM(u.total_filas), 0) AS total_filas,
-                       COALESCE(SUM(u.exitosas), 0) AS total_exitosas
+                       COALESCE(SUM(u.exitosas), 0) AS total_exitosas,
+                       (SELECT COUNT(*) FROM dispositivos d WHERE d.api_key = c.api_key) AS dispositivos_registrados
                 FROM clientes c
                 LEFT JOIN usos u ON u.api_key = c.api_key
                 GROUP BY c.api_key
@@ -296,12 +396,13 @@ def crear_o_actualizar_cliente(cliente: ClienteIn):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO clientes (api_key, empresa, nit, activo)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO clientes (api_key, empresa, nit, activo, limite_dispositivos)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (api_key) DO UPDATE
-                SET empresa = EXCLUDED.empresa, nit = EXCLUDED.nit, activo = EXCLUDED.activo
+                SET empresa = EXCLUDED.empresa, nit = EXCLUDED.nit, activo = EXCLUDED.activo,
+                    limite_dispositivos = EXCLUDED.limite_dispositivos
                 """,
-                (cliente.api_key, cliente.empresa, cliente.nit, cliente.activo),
+                (cliente.api_key, cliente.empresa, cliente.nit, cliente.activo, cliente.limite_dispositivos),
             )
         conn.commit()
     return {"status": "ok"}
@@ -312,6 +413,42 @@ def cambiar_estado_cliente(api_key: str, activo: bool):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE clientes SET activo = %s WHERE api_key = %s", (activo, api_key))
+        conn.commit()
+    return {"status": "ok"}
+
+
+@app.patch("/admin/clientes/{api_key}/limite-dispositivos", dependencies=[Depends(verificar_admin)])
+def cambiar_limite_dispositivos(api_key: str, limite: int):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE clientes SET limite_dispositivos = %s WHERE api_key = %s", (limite, api_key))
+        conn.commit()
+    return {"status": "ok"}
+
+
+@app.get("/admin/dispositivos", dependencies=[Depends(verificar_admin)])
+def listar_todos_dispositivos():
+    """Todos los equipos activados, de todos los clientes -- para el panel."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT c.empresa, d.api_key, d.device_id, d.ip, d.primera_vez, d.ultima_vez
+                FROM dispositivos d
+                JOIN clientes c ON c.api_key = d.api_key
+                ORDER BY c.empresa, d.primera_vez
+                """
+            )
+            filas = cur.fetchall()
+    return filas
+
+
+@app.delete("/admin/dispositivos/{api_key}/{device_id}", dependencies=[Depends(verificar_admin)])
+def liberar_dispositivo(api_key: str, device_id: str):
+    """Quita un equipo registrado, para que el cliente pueda activar la licencia en uno nuevo."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM dispositivos WHERE api_key = %s AND device_id = %s", (api_key, device_id))
         conn.commit()
     return {"status": "ok"}
 
